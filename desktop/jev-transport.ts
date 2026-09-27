@@ -3,13 +3,86 @@ import type { JevResponse } from './engine';
 const RETRYABLE = new Set([429, 503, 529]);
 const DEADLINE_MS = 25_000;
 const REPLACEMENT_DELAY_MS = 10_000;
-type Outcome = { kind: 'success'; value: JevResponse } | { kind: 'http'; status: number } |
+const ERROR_CAPTURE_LIMIT = 4096;
+const ERROR_DETAIL_LIMIT = 240;
+type Outcome = { kind: 'success'; value: JevResponse } | { kind: 'http'; status: number; detail?: string } |
   { kind: 'error'; error: unknown; phase: 'headers' | 'body' | 'deadline' };
 
 function cancelBody(response?: Response) {
   // Abort cancels an active JSON reader. An unconsumed late response still needs
   // its body cancelled explicitly; never wait for a losing stream to drain.
   if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
+}
+
+function privateRequestStrings(init: RequestInit): string[] {
+  if (typeof init.body !== 'string') return [];
+  let value: unknown;
+  try { value = JSON.parse(init.body); } catch { return []; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const root = value as Record<string, unknown>;
+  const strings: string[] = [], pending = [root.state, root.questions].filter(item => item !== undefined);
+  while (pending.length) {
+    const item = pending.pop();
+    if (typeof item === 'string') {
+      const normalized = item.replace(/\s+/g, ' ').trim();
+      if (normalized.length >= 4) strings.push(normalized);
+    }
+    else if (typeof item === 'number' && Number.isFinite(item)) {
+      const normalized = String(item);
+      if (normalized.length >= 4) strings.push(normalized);
+    }
+    else if (Array.isArray(item)) pending.push(...item);
+    else if (item && typeof item === 'object') pending.push(...Object.values(item));
+  }
+  return strings;
+}
+
+function repeatsPrivateInput(detail: string, init: RequestInit): boolean {
+  const authorization = new Headers(init.headers).get('authorization') || '';
+  const token = authorization.replace(/^Bearer\s+/i, '');
+  if ((authorization && detail.includes(authorization)) || (token && detail.includes(token))) return true;
+  for (const source of privateRequestStrings(init)) {
+    if (detail.includes(source)) return true;
+    for (let index = 0; index <= detail.length - 24; index++) {
+      if (source.includes(detail.slice(index, index + 24))) return true;
+    }
+  }
+  return false;
+}
+
+async function errorDetail(response: Response, init: RequestInit): Promise<string | undefined> {
+  if (!/\b(?:application\/json|[^;\s]+\+json)\b/i.test(response.headers.get('content-type') || '')) {
+    cancelBody(response);
+    return undefined;
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return undefined;
+  const decoder = new TextDecoder();
+  let raw = '', size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > ERROR_CAPTURE_LIMIT - size) { await reader.cancel(); return undefined; }
+      size += value.byteLength;
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } catch { return undefined; }
+  finally { reader.releaseLock(); }
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return undefined; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const body = value as { detail?: unknown; message?: unknown; error?: unknown };
+  const candidate = [body.detail, body.message, body.error,
+    body.error && typeof body.error === 'object' && !Array.isArray(body.error) ? (body.error as { message?: unknown }).message : undefined]
+    .filter((item): item is string => typeof item === 'string')
+    .map(item => item.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim())
+    .find(Boolean);
+  if (!candidate) return undefined;
+  const normalized = candidate;
+  const bounded = normalized.length <= ERROR_DETAIL_LIMIT ? normalized : `${normalized.slice(0, ERROR_DETAIL_LIMIT - 1)}…`;
+  return repeatsPrivateInput(bounded, init) ? undefined : bounded;
 }
 
 function pause(ms: number, signal?: AbortSignal): Promise<void> {
@@ -77,7 +150,11 @@ function attempt(endpoint: string, init: RequestInit, signal: AbortSignal | unde
           if (index === 0) { primaryHeaders = true; clearTimeout(replacementTimer); }
           if (settled) { cancelBody(response); return; }
           if (RETRYABLE.has(response.status)) { overloaded(); clearTimeout(replacementTimer); }
-          if (!response.ok) { cancelBody(response); failed(index, { kind: 'http', status: response.status }); return; }
+          if (!response.ok) {
+            failures[index] = { kind: 'http', status: response.status };
+            const detail = RETRYABLE.has(response.status) ? (cancelBody(response), undefined) : await errorDetail(response, init);
+            failed(index, { kind: 'http', status: response.status, detail }); return;
+          }
           phase = 'body';
           const value = await response.json() as JevResponse;
           if (!value || !value.answers || typeof value.answers !== 'object' || Array.isArray(value.answers)) {
@@ -109,6 +186,7 @@ export async function fetchJevInference(endpoint: string, init: RequestInit, sig
     if (outcome.kind === 'success') return outcome.value;
     if (outcome.kind === 'http') {
       if (RETRYABLE.has(outcome.status) && index < 2) { await pause(300 * 2 ** index, signal); continue; }
+      if (outcome.detail) throw new Error(`Jev returned HTTP ${outcome.status}: ${outcome.detail} No action executed.`);
       throw new Error(`Jev returned HTTP ${outcome.status}. Check your key, endpoint, and model. No action executed.`);
     }
     if (outcome.phase === 'body') throw outcome.error;
