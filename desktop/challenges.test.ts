@@ -88,7 +88,7 @@ describe('bounded verification assistance',()=>{
 
 // All pages and provider URLs are intercepted locally. No external CAPTCHA or
 // model request is executed; these fixtures exercise Chromium isolation/input.
-async function fixture(options:{kind?:'recaptcha'|'hcaptcha';overlay?:boolean;translucent?:boolean;transparentChild?:boolean;sameOrigin?:boolean;invisible?:boolean;completed?:boolean;scroll?:boolean;image?:boolean;reject?:boolean;responseDelayMs?:number;imageDelayMs?:number;replaceResponse?:boolean},check:(browser:BrowserAdapter,page:any,calls:Array<any>)=>Promise<void>){
+async function fixture(options:{kind?:'recaptcha'|'hcaptcha';overlay?:boolean;translucent?:boolean;transparentChild?:boolean;sameOrigin?:boolean;invisible?:boolean;completed?:boolean;scroll?:boolean;image?:boolean;reject?:boolean;responseDelayMs?:number;imageDelayMs?:number;imageLoadDelayMs?:number;replaceResponse?:boolean},check:(browser:BrowserAdapter,page:any,calls:Array<any>)=>Promise<void>){
   const {chromium}=await import('@playwright/test');
   const browser=await chromium.launch({headless:true,executablePath:process.env.JEVRY_BROWSER_EXECUTABLE||undefined});
   try{
@@ -98,6 +98,7 @@ async function fixture(options:{kind?:'recaptcha'|'hcaptcha';overlay?:boolean;tr
     const imageUrl=provider==='recaptcha'?'https://www.google.com/recaptcha/api2/bframe?x=1':'https://newassets.hcaptcha.com/captcha/v1/test/static/hcaptcha.html#frame=challenge';
     await context.route('**/*',async route=>{
       const url=new URL(route.request().url());
+      if(url.href===imageUrl&&options.imageLoadDelayMs)await new Promise(resolve=>setTimeout(resolve,options.imageLoadDelayMs));
       if(url.hostname==='fixture.test'||options.sameOrigin&&url.hostname==='www.google.com'&&url.pathname==='/local-fixture'){
         const top=options.scroll?500:40;
         await route.fulfill({contentType:'text/html',body:`<!doctype html><title>Local verification fixture</title><body style="margin:0;height:1800px;background:rgb(240,0,0)"><form>
@@ -109,7 +110,7 @@ async function fixture(options:{kind?:'recaptcha'|'hcaptcha';overlay?:boolean;tr
           <script>window.fixtureClicks=0;addEventListener('message',e=>{
             if(e.data!=='fixture-accepted')return;window.fixtureClicks++;
             if(${Boolean(options.imageDelayMs)}&&e.source===document.querySelector('#anchor').contentWindow){
-              setTimeout(()=>{const image=document.createElement('iframe');image.id='challenge';image.src='${imageUrl}';image.style.cssText='position:absolute;top:${top+100}px;left:40px;width:304px;height:240px;border:0';document.querySelector('form').appendChild(image);},${options.imageDelayMs||0});return;
+              setTimeout(()=>{const image=document.createElement('iframe');image.id='challenge';image.src='${imageUrl}';image.style.cssText='visibility:hidden;position:absolute;top:${top+100}px;left:40px;width:304px;height:240px;border:0';image.onload=()=>{image.style.visibility='visible';};document.querySelector('form').appendChild(image);},${options.imageDelayMs||0});return;
             }
             if(!${Boolean(options.reject)})setTimeout(()=>{let field=document.querySelector('textarea');if(${Boolean(options.replaceResponse)}){const next=field.cloneNode();field.replaceWith(next);field=next;}field.value='fixture-completion-value';},${options.responseDelayMs||0});
           });</script>`});
@@ -177,8 +178,10 @@ describe.runIf(process.env.JEVRY_BROWSER_TEST==='1')('verification in actual Chr
       expect(await page.locator('#anchor').evaluate((e:HTMLElement)=>[e.style.getPropertyValue('background-color'),e.style.getPropertyValue('background-clip')])).toEqual(['','']);
     });
   });
+  // The single-answer fixture must reveal a loaded document, not its initial
+  // about:blank frame. Delay the response too so CI exercises that ordering.
   it('waits for a delayed visible image challenge before requesting one visual answer',async()=>{
-    await fixture({imageDelayMs:1500},async(browser,page,calls)=>{
+    await fixture({imageDelayMs:1500,imageLoadDelayMs:500},async(browser,page,calls)=>{
       const infer=vi.fn(async(_config:any,_prompt:string,image:{data:string})=>{
         expect(await page.evaluate(()=>(window as any).fixtureClicks)).toBe(1);
         expect(calls.filter(c=>c.method==='Page.captureScreenshot')).toHaveLength(3);
