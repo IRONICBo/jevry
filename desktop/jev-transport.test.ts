@@ -164,6 +164,69 @@ describe('bounded delayed inference replacement', () => {
     }
   });
 
+  it.each([
+    { error: { message: 'Unknown model fixture-model' } },
+    { message: 'Unknown model fixture-model' },
+    { detail: 'Unknown model fixture-model' },
+    { error: 'Unknown model fixture-model' },
+  ])('preserves structured HTTP 400 details without retrying: %j', async body => {
+    const { calls, fetch } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toThrow('Server detail: Unknown model fixture-model');
+    calls[0].respond(new Response(JSON.stringify(body), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await rejected; await vi.advanceTimersByTimeAsync(30000);
+    expect(fetch).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('redacts echoed credentials before truncating the server detail', async () => {
+    const { calls } = network();
+    const key = 'fixture-private-credential';
+    const work = fetchJevInference(endpoint, { ...init, headers: { Authorization: `Bearer ${key}` } });
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('[redacted]') && !error.message.includes(key) &&
+      !error.message.includes('sk-another-secret') && !error.message.includes('other-secret') &&
+      !error.message.includes('\n') && error.message.length < 800);
+    calls[0].respond(new Response(JSON.stringify({ error: { message:
+      `Invalid ${key}\nBearer ${key}; sk-another-secret api_key=other-secret ` + 'x'.repeat(1000),
+    } }), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await rejected;
+  });
+
+  it.each([
+    ['text/html', '<html>private gateway dump</html>'],
+    ['application/json', '{broken'],
+    ['application/json', JSON.stringify({ detail: [{ input: 'private request state', msg: 'invalid' }] })],
+    ['application/json', JSON.stringify({ message: 'x'.repeat(9000) })],
+  ])('keeps the HTTP status without dumping unsafe or oversized bodies', async (type, body) => {
+    const { calls } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes('Server detail:'));
+    calls[0].respond(new Response(body, { status: 400, headers: { 'Content-Type': type } }));
+    await rejected; expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('preserves HTTP 400 when its error body stalls and cancels the reader', async () => {
+    const { calls, fetch } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toThrow('HTTP 400');
+    const body = streaming(calls[0].signal);
+    calls[0].respond(new Response(body.response.body, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await vi.advanceTimersByTimeAsync(1000); await rejected;
+    expect(fetch).toHaveBeenCalledOnce(); expect(calls[0].signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('honors caller cancellation while reading error details', async () => {
+    const { calls } = network(); const controller = new AbortController();
+    const work = fetchJevInference(endpoint, init, controller.signal);
+    const rejected = expect(work).rejects.toThrow('aborted');
+    const body = streaming(calls[0].signal);
+    calls[0].respond(new Response(body.response.body, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await vi.advanceTimersByTimeAsync(0); controller.abort();
+    // The reason is created at abort time.
+    await expect(work).rejects.toBe(controller.signal.reason);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('makes no request for an already-cancelled caller', async () => {
     const { fetch } = network(); const controller = new AbortController(); controller.abort();
     await expect(fetchJevInference(endpoint, init, controller.signal)).rejects.toBe(controller.signal.reason);

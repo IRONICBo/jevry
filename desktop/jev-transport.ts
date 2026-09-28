@@ -3,8 +3,63 @@ import type { JevResponse } from './engine';
 const RETRYABLE = new Set([429, 503, 529]);
 const DEADLINE_MS = 25_000;
 const REPLACEMENT_DELAY_MS = 10_000;
-type Outcome = { kind: 'success'; value: JevResponse } | { kind: 'http'; status: number } |
+type Outcome = { kind: 'success'; value: JevResponse } | { kind: 'http'; status: number; detail?: string } |
   { kind: 'error'; error: unknown; phase: 'headers' | 'body' | 'deadline' };
+
+/** Only read a small structured error, never dump HTML or the request state. */
+async function errorDetail(response: Response, init: RequestInit, controller: AbortController): Promise<string | undefined> {
+  if (!response.body || !response.headers.get('content-type')?.includes('application/json')) {
+    cancelBody(response); return;
+  }
+  const reader = response.body.getReader();
+  const timer = setTimeout(() => controller.abort(new DOMException('Error details timed out.', 'TimeoutError')), 1000);
+  try {
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 8192) return;
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const data = JSON.parse(new TextDecoder().decode(bytes));
+    const detail = data?.error?.message ?? data?.message ?? data?.detail ?? data?.error;
+    // Validation arrays can include the original input; never serialize them.
+    if (typeof detail !== 'string') return;
+    let safe = detail;
+    const authorization = new Headers(init.headers).get('authorization') || '';
+    for (const secret of [authorization, authorization.replace(/^Bearer\s+/i, '')]) {
+      if (secret) safe = safe.split(secret).join('[redacted]');
+    }
+    return safe.replace(/\b(?:Bearer|Basic)\s+[^\s"'<>]+/gi, '[redacted]')
+      .replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]')
+      .replace(/((?:access_token|refresh_token|api_key|client_secret)["']?\s*[:=]\s*["']?)[^\s"'&,}]+/gi, '$1[redacted]')
+      .replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 400) || undefined;
+  } catch { return; }
+  finally {
+    clearTimeout(timer);
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+function httpError(status: number, detail?: string): Error {
+  const guidance = status === 400 || status === 422
+    ? 'Jev rejected the request. Check the Jev model and endpoint in Connections; if they are correct, report this error with the task that triggered it.'
+    : status === 401 || status === 403
+      ? 'Check your TypeSafe API key and its access in Connections.'
+      : status === 404
+        ? 'Check the Jev endpoint and model in Connections.'
+        : status === 429
+          ? 'The Jev rate limit was reached. Wait briefly and try again.'
+          : status >= 500 ? 'Jev is temporarily unavailable. Try again shortly.'
+            : 'Check your Jev connection in Connections.';
+  return new Error(`Jev returned HTTP ${status}. ${guidance}${detail ? ` Server detail: ${detail}` : ''} No action executed.`);
+}
 
 function cancelBody(response?: Response) {
   // Abort cancels an active JSON reader. An unconsumed late response still needs
@@ -77,7 +132,14 @@ function attempt(endpoint: string, init: RequestInit, signal: AbortSignal | unde
           if (index === 0) { primaryHeaders = true; clearTimeout(replacementTimer); }
           if (settled) { cancelBody(response); return; }
           if (RETRYABLE.has(response.status)) { overloaded(); clearTimeout(replacementTimer); }
-          if (!response.ok) { cancelBody(response); failed(index, { kind: 'http', status: response.status }); return; }
+          if (!response.ok) {
+            // Keep the known status even if its optional body stalls or fails.
+            const failure: Extract<Outcome, { kind: 'http' }> = { kind: 'http', status: response.status };
+            failures[index] = failure;
+            if (RETRYABLE.has(response.status)) cancelBody(response);
+            else failure.detail = await errorDetail(response, init, controller);
+            failed(index, failure); return;
+          }
           phase = 'body';
           const value = await response.json() as JevResponse;
           if (!value || !value.answers || typeof value.answers !== 'object' || Array.isArray(value.answers)) {
@@ -109,7 +171,7 @@ export async function fetchJevInference(endpoint: string, init: RequestInit, sig
     if (outcome.kind === 'success') return outcome.value;
     if (outcome.kind === 'http') {
       if (RETRYABLE.has(outcome.status) && index < 2) { await pause(300 * 2 ** index, signal); continue; }
-      throw new Error(`Jev returned HTTP ${outcome.status}. Check your key, endpoint, and model. No action executed.`);
+      throw httpError(outcome.status, outcome.detail);
     }
     if (outcome.phase === 'body') throw outcome.error;
     throw new Error(outcome.phase === 'deadline' ? 'Jev timed out. No action executed.' : 'Could not connect to Jev. No action executed.', { cause: outcome.error });
