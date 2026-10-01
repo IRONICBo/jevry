@@ -88,7 +88,7 @@ describe('bounded verification assistance',()=>{
 
 // All pages and provider URLs are intercepted locally. No external CAPTCHA or
 // model request is executed; these fixtures exercise Chromium isolation/input.
-async function fixture(options:{kind?:'recaptcha'|'hcaptcha';overlay?:boolean;translucent?:boolean;transparentChild?:boolean;sameOrigin?:boolean;invisible?:boolean;completed?:boolean;scroll?:boolean;image?:boolean;reject?:boolean;responseDelayMs?:number;imageDelayMs?:number;replaceResponse?:boolean},check:(browser:BrowserAdapter,page:any,calls:Array<any>)=>Promise<void>){
+async function fixture(options:{kind?:'recaptcha'|'hcaptcha';overlay?:boolean;translucent?:boolean;transparentChild?:boolean;sameOrigin?:boolean;invisible?:boolean;completed?:boolean;scroll?:boolean;image?:boolean;reject?:boolean;responseDelayMs?:number;imageDelayMs?:number;imageLoadDelayMs?:number;replaceResponse?:boolean},check:(browser:BrowserAdapter,page:any,calls:Array<any>)=>Promise<void>){
   const {chromium}=await import('@playwright/test');
   const browser=await chromium.launch({headless:true,executablePath:process.env.JEVRY_BROWSER_EXECUTABLE||undefined});
   try{
@@ -98,18 +98,19 @@ async function fixture(options:{kind?:'recaptcha'|'hcaptcha';overlay?:boolean;tr
     const imageUrl=provider==='recaptcha'?'https://www.google.com/recaptcha/api2/bframe?x=1':'https://newassets.hcaptcha.com/captcha/v1/test/static/hcaptcha.html#frame=challenge';
     await context.route('**/*',async route=>{
       const url=new URL(route.request().url());
+      if(url.href===imageUrl&&options.imageLoadDelayMs)await new Promise(resolve=>setTimeout(resolve,options.imageLoadDelayMs));
       if(url.hostname==='fixture.test'||options.sameOrigin&&url.hostname==='www.google.com'&&url.pathname==='/local-fixture'){
         const top=options.scroll?500:40;
         await route.fulfill({contentType:'text/html',body:`<!doctype html><title>Local verification fixture</title><body style="margin:0;height:1800px;background:rgb(240,0,0)"><form>
           ${options.translucent||options.transparentChild?`<div style="position:absolute;top:${top}px;left:40px;width:304px;height:340px;background:rgb(255,0,255)">PRIVATE underlying page text</div>`:''}
           <iframe id="anchor" src="${frameUrl}" style="position:absolute;top:${top}px;left:40px;width:304px;height:78px;border:0;opacity:${options.translucent?0.5:1}"></iframe>
-          ${options.image?`<iframe id="challenge" src="${imageUrl}" style="position:absolute;top:${top+100}px;left:40px;width:304px;height:240px;border:0"></iframe>`:''}
+          ${options.image||options.imageDelayMs?`<iframe id="challenge" src="${imageUrl}" style="visibility:${options.imageDelayMs?'hidden':'visible'};position:absolute;top:${top+100}px;left:40px;width:304px;height:240px;border:0"></iframe>`:''}
           <textarea hidden name="${provider==='recaptcha'?'g-recaptcha-response':'h-captcha-response'}">${options.completed?'already-present-fixture-value':''}</textarea>
           </form>${options.overlay?`<div style="position:absolute;top:${top}px;left:40px;width:304px;height:78px;background:white;z-index:3">Unrelated private overlay</div>`:''}
           <script>window.fixtureClicks=0;addEventListener('message',e=>{
             if(e.data!=='fixture-accepted')return;window.fixtureClicks++;
             if(${Boolean(options.imageDelayMs)}&&e.source===document.querySelector('#anchor').contentWindow){
-              setTimeout(()=>{const image=document.createElement('iframe');image.id='challenge';image.src='${imageUrl}';image.style.cssText='position:absolute;top:${top+100}px;left:40px;width:304px;height:240px;border:0';document.querySelector('form').appendChild(image);},${options.imageDelayMs||0});return;
+              setTimeout(()=>{document.querySelector('#challenge').style.visibility='visible';},${options.imageDelayMs||0});return;
             }
             if(!${Boolean(options.reject)})setTimeout(()=>{let field=document.querySelector('textarea');if(${Boolean(options.replaceResponse)}){const next=field.cloneNode();field.replaceWith(next);field=next;}field.value='fixture-completion-value';},${options.responseDelayMs||0});
           });</script>`});
@@ -177,14 +178,20 @@ describe.runIf(process.env.JEVRY_BROWSER_TEST==='1')('verification in actual Chr
       expect(await page.locator('#anchor').evaluate((e:HTMLElement)=>[e.style.getPropertyValue('background-color'),e.style.getPropertyValue('background-clip')])).toEqual(['','']);
     });
   });
+  // Preload the hidden child during page.goto's load barrier, then reveal it
+  // after the checkbox delay. This test needs a stable document and CDP target;
+  // creating a cross-process iframe mid-run races target registration/painting.
   it('waits for a delayed visible image challenge before requesting one visual answer',async()=>{
-    await fixture({imageDelayMs:1500},async(browser,page,calls)=>{
+    await fixture({imageDelayMs:1500,imageLoadDelayMs:500},async(browser,page,calls)=>{
+      const inferenceEvidence:Array<{clicks:number;captures:number}>=[];
       const infer=vi.fn(async(_config:any,_prompt:string,image:{data:string})=>{
-        expect(await page.evaluate(()=>(window as any).fixtureClicks)).toBe(1);
-        expect(calls.filter(c=>c.method==='Page.captureScreenshot')).toHaveLength(3);
+        inferenceEvidence.push({clicks:await page.evaluate(()=>(window as any).fixtureClicks),captures:calls.filter(c=>c.method==='Page.captureScreenshot').length});
         const png=Buffer.from(image.data,'base64');return JSON.stringify({action:'click',x:Math.round(28*png.readUInt32BE(16)/304),y:Math.round(37*png.readUInt32BE(20)/240)});
       });
       expect(await solveChallenge(browser,config,new AbortController().signal,()=>{},{infer})).toEqual({detected:true,solved:true});
+      // Keep assertions outside the provider callback so solver error handling
+      // cannot swallow a failed assertion and hide its useful diff.
+      expect(inferenceEvidence).toEqual([{clicks:1,captures:3}]);
       expect(infer).toHaveBeenCalledOnce();expect(await page.evaluate(()=>(window as any).fixtureClicks)).toBe(2);
       expect(calls.filter(c=>c.params?.type==='mousePressed')).toHaveLength(2);
     });

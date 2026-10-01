@@ -164,58 +164,37 @@ describe('bounded delayed inference replacement', () => {
     }
   });
 
-  it('includes a bounded scalar JSON detail for a permanent HTTP failure', async () => {
-    const { calls, fetch } = network();
-    const work = fetchJevInference(endpoint, init);
-    const rejected = expect(work).rejects.toThrow(
-      'Jev returned HTTP 400: Unknown model "jev-preview". No action executed.',
-    );
-    calls[0].respond(new Response(JSON.stringify({ detail: 'Unknown model "jev-preview".' }), {
+  it.each([
+    { error: { message: 'Unknown model fixture-model' } },
+    { message: 'Unknown model fixture-model' },
+    { detail: 'Unknown model fixture-model' },
+    { detail: { error_type: 'api_usage_error', message: 'Unknown model fixture-model' } },
+    { error: 'Unknown model fixture-model' },
+  ])('preserves structured HTTP 400 details without retrying: %j', async body => {
+    const { calls, fetch } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toThrow('Server detail: Unknown model fixture-model');
+    calls[0].respond(new Response(JSON.stringify(body), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await rejected; await vi.advanceTimersByTimeAsync(30000);
+    expect(fetch).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('reads a structured application/problem+json error', async () => {
+    const { calls } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toThrow('Server detail: Unknown model fixture-model');
+    calls[0].respond(new Response(JSON.stringify({ message: 'Unknown model fixture-model' }), {
       status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    }));
-    await rejected;
-    await vi.advanceTimersByTimeAsync(30000);
-    expect(fetch).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it('normalizes and truncates a long scalar HTTP error detail', async () => {
-    const { calls } = network();
-    const work = fetchJevInference(endpoint, init);
-    const detail = `  Invalid\nrequest ${'x'.repeat(300)}`;
-    const expected = `Invalid request ${'x'.repeat(223)}…`;
-    const rejected = expect(work).rejects.toThrow(
-      `Jev returned HTTP 422: ${expected} No action executed.`,
-    );
-    calls[0].respond(new Response(JSON.stringify({ message: detail }), {
-      status: 422,
-      headers: { 'Content-Type': 'application/problem+json' },
+      headers: { 'Content-Type': 'application/problem+json; charset=utf-8' },
     }));
     await rejected;
   });
 
-  it('does not expose structured validation payloads in an HTTP error', async () => {
-    const { calls } = network();
-    const work = fetchJevInference(endpoint, init);
-    const rejected = expect(work).rejects.toThrow(
-      'Jev returned HTTP 422. Check your key, endpoint, and model. No action executed.',
-    );
-    calls[0].respond(new Response(JSON.stringify({ detail: [{ input: 'private page state' }] }), {
-      status: 422,
-      headers: { 'Content-Type': 'application/json' },
-    }));
-    await rejected;
-  });
-
-  it('does not expose a scalar error detail copied from the request body', async () => {
+  it('suppresses a scalar error detail copied from private request state', async () => {
     const privateState = 'customer account 8842 has a private billing dispute';
-    const privateInit = { ...init, body: JSON.stringify({ state: privateState }) };
-    const { calls } = network();
-    const work = fetchJevInference(endpoint, privateInit);
-    const rejected = expect(work).rejects.toThrow(
-      'Jev returned HTTP 400. Check your key, endpoint, and model. No action executed.',
-    );
+    const privateInit = { ...init, body: JSON.stringify({ state: { privateState } }) };
+    const { calls } = network(); const work = fetchJevInference(endpoint, privateInit);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes(privateState) &&
+      !error.message.includes('Server detail:'));
     calls[0].respond(new Response(JSON.stringify({ message: `Invalid state: ${privateState}` }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
@@ -223,18 +202,17 @@ describe('bounded delayed inference replacement', () => {
     await rejected;
   });
 
-  it('does not expose private state after a large question set', async () => {
+  it('finds private state even after a large question set', async () => {
     const privateState = 'customer account 8842 has a private billing dispute';
-    const decoys = Object.fromEntries(Array.from({ length: 160 }, (_, index) => [
+    const questions = Object.fromEntries(Array.from({ length: 160 }, (_, index) => [
       `question_${index}`,
-      `public validation instruction number ${index}`,
+      { type: 'choice', question: `public validation instruction number ${index}` },
     ]));
-    const privateInit = { ...init, body: JSON.stringify({ state: { privateState }, questions: decoys }) };
-    const { calls } = network();
-    const work = fetchJevInference(endpoint, privateInit);
-    const rejected = expect(work).rejects.toThrow(
-      'Jev returned HTTP 400. Check your key, endpoint, and model. No action executed.',
-    );
+    const privateInit = { ...init, body: JSON.stringify({ state: { privateState }, questions }) };
+    const { calls } = network(); const work = fetchJevInference(endpoint, privateInit);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes(privateState) &&
+      !error.message.includes('Server detail:'));
     calls[0].respond(new Response(JSON.stringify({ message: `Invalid state: ${privateState}` }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
@@ -242,13 +220,12 @@ describe('bounded delayed inference replacement', () => {
     await rejected;
   });
 
-  it.each(['a@b.co', '0427'])('does not expose a short private request value: %s', async privateValue => {
+  it.each(['a@b.co', '0427'])('suppresses a short private request value: %s', async privateValue => {
     const privateInit = { ...init, body: JSON.stringify({ state: { privateValue } }) };
-    const { calls } = network();
-    const work = fetchJevInference(endpoint, privateInit);
-    const rejected = expect(work).rejects.toThrow(
-      'Jev returned HTTP 400. Check your key, endpoint, and model. No action executed.',
-    );
+    const { calls } = network(); const work = fetchJevInference(endpoint, privateInit);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes(privateValue) &&
+      !error.message.includes('Server detail:'));
     calls[0].respond(new Response(JSON.stringify({ message: `Invalid value ${privateValue}` }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
@@ -256,65 +233,143 @@ describe('bounded delayed inference replacement', () => {
     await rejected;
   });
 
-  it('ignores and cancels an oversized JSON error body', async () => {
-    const cancel = vi.fn();
-    const oversized = new ReadableStream<Uint8Array>({
-      start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify({ detail: 'x'.repeat(5000) }))); },
-      cancel,
-    });
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(oversized, {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    }))));
-    await expect(fetchJevInference(endpoint, init)).rejects.toThrow(
-      'Jev returned HTTP 400. Check your key, endpoint, and model. No action executed.',
-    );
-    expect(cancel).toHaveBeenCalledOnce();
-  });
-
-  it('cancels one oversized stream chunk without retaining it as error detail', async () => {
-    const cancel = vi.fn();
-    const oversized = new ReadableStream<Uint8Array>({
-      pull(controller) { controller.enqueue(new TextEncoder().encode('x'.repeat(65536))); },
-      cancel,
-    });
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(oversized, {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    }))));
-    await expect(fetchJevInference(endpoint, init)).rejects.toThrow(
-      'Jev returned HTTP 400. Check your key, endpoint, and model. No action executed.',
-    );
-    expect(cancel).toHaveBeenCalledOnce();
-  });
-
-  it('falls through an empty detail field to a usable message', async () => {
-    const { calls } = network();
-    const work = fetchJevInference(endpoint, init);
-    const rejected = expect(work).rejects.toThrow(
-      'Jev returned HTTP 400: Unknown model. No action executed.',
-    );
-    calls[0].respond(new Response(JSON.stringify({ detail: '  ', message: 'Unknown model.' }), {
+  it('checks private input before truncating the displayed detail', async () => {
+    const privateValue = 'private.person@example.com';
+    const privateInit = { ...init, body: JSON.stringify({ state: { privateValue } }) };
+    const { calls } = network(); const work = fetchJevInference(endpoint, privateInit);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes('private.person@') &&
+      !error.message.includes('Server detail:'));
+    calls[0].respond(new Response(JSON.stringify({ message: 'x'.repeat(385) + privateValue }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
     }));
     await rejected;
   });
 
-  it('retains a permanent HTTP status when its JSON error body stalls', async () => {
+  it('normalizes repeated whitespace before comparing private input', async () => {
+    const privateInit = { ...init, body: JSON.stringify({ state: { name: 'Alice  Smith' } }) };
+    const { calls } = network(); const work = fetchJevInference(endpoint, privateInit);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes('Alice') &&
+      !error.message.includes('Server detail:'));
+    calls[0].respond(new Response(JSON.stringify({ message: 'Invalid customer: Alice\t\tSmith' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    await rejected;
+  });
+
+  it('does not treat the public question discriminator as private input', async () => {
+    const privateInit = { ...init, body: JSON.stringify({
+      state: { page: 'settings' },
+      questions: { operation: { type: 'choice', criteria: { SAVE: 'Save settings' } } },
+    }) };
+    const { calls } = network(); const work = fetchJevInference(endpoint, privateInit);
+    const rejected = expect(work).rejects.toThrow('Server detail: Invalid choice criteria: expected at least one option');
+    calls[0].respond(new Response(JSON.stringify({ message: 'Invalid choice criteria: expected at least one option' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    await rejected;
+  });
+
+  it.each([
+    [{ type: 'private-oncology-diagnosis' }, 'Invalid state: private-oncology-diagnosis'],
+    [{ name: 'Alice\u0000Smith' }, 'Invalid customer: Alice\u0000Smith'],
+  ])('still protects normalized private state fields: %j', async (state, message) => {
+    const privateInit = { ...init, body: JSON.stringify({
+      state,
+      questions: { operation: { type: 'choice', criteria: { SAVE: 'Save settings' } } },
+    }) };
+    const { calls } = network(); const work = fetchJevInference(endpoint, privateInit);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes('Server detail:'));
+    calls[0].respond(new Response(JSON.stringify({ message }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/problem+json' },
+    }));
+    await rejected;
+  });
+
+  it('explains the live max_tokens_exceeded response even when no message is supplied', async () => {
+    const { calls, fetch } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && error.message.includes('input limit') &&
+      error.message.includes('max_tokens_exceeded') && !error.message.includes('Check the Jev model'));
+    calls[0].respond(new Response(JSON.stringify({ detail: { error_type: 'max_tokens_exceeded' } }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await rejected; await vi.advanceTimersByTimeAsync(30000);
+    expect(fetch).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('redacts credentials before a display boundary can split the key', async () => {
+    const { calls } = network(); const key = 'fixture-private-api-key-0123456789abcdef';
+    const work = fetchJevInference(endpoint, { ...init, headers: { Authorization: `Bearer ${key}` } });
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      !error.message.includes(key.slice(0, 18)) && error.message.includes('[redacted]'));
+    calls[0].respond(new Response(JSON.stringify({ message: 'x'.repeat(380) + ' ' + key }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await rejected;
+  });
+
+  it('does not echo arbitrary error-code fields', async () => {
+    const { calls } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes('private_customer_value'));
+    calls[0].respond(new Response(JSON.stringify({ detail: { error_type: 'private_customer_value' } }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await rejected;
+  });
+
+  it('redacts echoed credentials before truncating the server detail', async () => {
     const { calls } = network();
-    const work = fetchJevInference(endpoint, init);
-    const rejected = expect(work).rejects.toThrow(
-      'Jev returned HTTP 400. Check your key, endpoint, and model. No action executed.',
-    );
+    const key = 'fixture-private-credential';
+    const work = fetchJevInference(endpoint, { ...init, headers: { Authorization: `Bearer ${key}` } });
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('[redacted]') && !error.message.includes(key) &&
+      !error.message.includes('sk-another-secret') && !error.message.includes('other-secret') &&
+      !error.message.includes('\n') && error.message.length < 800);
+    calls[0].respond(new Response(JSON.stringify({ error: { message:
+      `Invalid ${key}\nBearer ${key}; sk-another-secret api_key=other-secret ` + 'x'.repeat(1000),
+    } }), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await rejected;
+  });
+
+  it.each([
+    ['text/html', '<html>private gateway dump</html>'],
+    ['application/json', '{broken'],
+    ['application/json', JSON.stringify({ detail: [{ input: 'private request state', msg: 'invalid' }] })],
+    ['application/json', JSON.stringify({ message: 'x'.repeat(9000) })],
+  ])('keeps the HTTP status without dumping unsafe or oversized bodies', async (type, body) => {
+    const { calls } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toSatisfy((error: Error) =>
+      error.message.includes('HTTP 400') && !error.message.includes('Server detail:'));
+    calls[0].respond(new Response(body, { status: 400, headers: { 'Content-Type': type } }));
+    await rejected; expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('preserves HTTP 400 when its error body stalls and cancels the reader', async () => {
+    const { calls, fetch } = network(); const work = fetchJevInference(endpoint, init);
+    const rejected = expect(work).rejects.toThrow('HTTP 400');
     const body = streaming(calls[0].signal);
-    calls[0].respond(new Response(body.response.body, {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    }));
-    await vi.advanceTimersByTimeAsync(25000);
+    calls[0].respond(new Response(body.response.body, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await vi.advanceTimersByTimeAsync(1000); await rejected;
+    expect(fetch).toHaveBeenCalledOnce(); expect(calls[0].signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('honors caller cancellation while reading error details', async () => {
+    const { calls } = network(); const controller = new AbortController();
+    const work = fetchJevInference(endpoint, init, controller.signal);
+    const rejected = expect(work).rejects.toThrow('aborted');
+    const body = streaming(calls[0].signal);
+    calls[0].respond(new Response(body.response.body, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await vi.advanceTimersByTimeAsync(0); controller.abort();
+    // The reason is created at abort time.
+    await expect(work).rejects.toBe(controller.signal.reason);
     await rejected;
-    expect(calls[0].signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('makes no request for an already-cancelled caller', async () => {

@@ -3,15 +3,12 @@ import type { JevResponse } from './engine';
 const RETRYABLE = new Set([429, 503, 529]);
 const DEADLINE_MS = 25_000;
 const REPLACEMENT_DELAY_MS = 10_000;
-const ERROR_CAPTURE_LIMIT = 4096;
-const ERROR_DETAIL_LIMIT = 240;
-type Outcome = { kind: 'success'; value: JevResponse } | { kind: 'http'; status: number; detail?: string } |
+type HttpDetails = { detail?: string; code?: string };
+type Outcome = { kind: 'success'; value: JevResponse } | ({ kind: 'http'; status: number } & HttpDetails) |
   { kind: 'error'; error: unknown; phase: 'headers' | 'body' | 'deadline' };
 
-function cancelBody(response?: Response) {
-  // Abort cancels an active JSON reader. An unconsumed late response still needs
-  // its body cancelled explicitly; never wait for a losing stream to drain.
-  if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
+function normalizePrivateText(value: string): string {
+  return value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function privateRequestStrings(init: RequestInit): string[] {
@@ -20,69 +17,110 @@ function privateRequestStrings(init: RequestInit): string[] {
   try { value = JSON.parse(init.body); } catch { return []; }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
   const root = value as Record<string, unknown>;
-  const strings: string[] = [], pending = [root.state, root.questions].filter(item => item !== undefined);
+  const questions = root.questions && typeof root.questions === 'object' && !Array.isArray(root.questions)
+    ? Object.values(root.questions as Record<string, unknown>) : [];
+  const strings: string[] = [];
+  const pending: Array<{ item: unknown; questionRoot: boolean }> = [
+    ...(root.state === undefined ? [] : [{ item: root.state, questionRoot: false }]),
+    ...questions.map(item => ({ item, questionRoot: true })),
+  ];
   while (pending.length) {
-    const item = pending.pop();
+    const { item, questionRoot } = pending.pop()!;
     if (typeof item === 'string') {
-      const normalized = item.replace(/\s+/g, ' ').trim();
+      const normalized = normalizePrivateText(item);
       if (normalized.length >= 4) strings.push(normalized);
-    }
-    else if (typeof item === 'number' && Number.isFinite(item)) {
+    } else if (typeof item === 'number' && Number.isFinite(item)) {
       const normalized = String(item);
       if (normalized.length >= 4) strings.push(normalized);
+    } else if (Array.isArray(item)) pending.push(...item.map(child => ({ item: child, questionRoot: false })));
+    else if (item && typeof item === 'object') {
+      pending.push(...Object.entries(item)
+        // Question discriminators are public schema metadata, not user input.
+        .filter(([key]) => !questionRoot || key !== 'type')
+        .map(([, child]) => ({ item: child, questionRoot: false })));
     }
-    else if (Array.isArray(item)) pending.push(...item);
-    else if (item && typeof item === 'object') pending.push(...Object.values(item));
   }
   return strings;
 }
 
 function repeatsPrivateInput(detail: string, init: RequestInit): boolean {
-  const authorization = new Headers(init.headers).get('authorization') || '';
-  const token = authorization.replace(/^Bearer\s+/i, '');
-  if ((authorization && detail.includes(authorization)) || (token && detail.includes(token))) return true;
+  const normalizedDetail = normalizePrivateText(detail);
   for (const source of privateRequestStrings(init)) {
-    if (detail.includes(source)) return true;
-    for (let index = 0; index <= detail.length - 24; index++) {
-      if (source.includes(detail.slice(index, index + 24))) return true;
+    if (normalizedDetail.includes(source)) return true;
+    for (let index = 0; index <= normalizedDetail.length - 24; index++) {
+      if (source.includes(normalizedDetail.slice(index, index + 24))) return true;
     }
   }
   return false;
 }
 
-async function errorDetail(response: Response, init: RequestInit): Promise<string | undefined> {
-  if (!/\b(?:application\/json|[^;\s]+\+json)\b/i.test(response.headers.get('content-type') || '')) {
-    cancelBody(response);
-    return undefined;
+/** Only read a small structured error, never dump HTML or the request state. */
+async function errorDetail(response: Response, init: RequestInit, controller: AbortController): Promise<HttpDetails> {
+  const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() || '';
+  if (!response.body || (contentType !== 'application/json' && !contentType.endsWith('+json'))) {
+    cancelBody(response); return {};
   }
-  const reader = response.body?.getReader();
-  if (!reader) return undefined;
-  const decoder = new TextDecoder();
-  let raw = '', size = 0;
+  const reader = response.body.getReader();
+  const timer = setTimeout(() => controller.abort(new DOMException('Error details timed out.', 'TimeoutError')), 1000);
   try {
+    const chunks: Uint8Array[] = [];
+    let size = 0;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value.byteLength > ERROR_CAPTURE_LIMIT - size) { await reader.cancel(); return undefined; }
       size += value.byteLength;
-      raw += decoder.decode(value, { stream: true });
+      if (size > 8192) return {};
+      chunks.push(value);
     }
-    raw += decoder.decode();
-  } catch { return undefined; }
-  finally { reader.releaseLock(); }
-  let value: unknown;
-  try { value = JSON.parse(raw); } catch { return undefined; }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const body = value as { detail?: unknown; message?: unknown; error?: unknown };
-  const candidate = [body.detail, body.message, body.error,
-    body.error && typeof body.error === 'object' && !Array.isArray(body.error) ? (body.error as { message?: unknown }).message : undefined]
-    .filter((item): item is string => typeof item === 'string')
-    .map(item => item.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim())
-    .find(Boolean);
-  if (!candidate) return undefined;
-  const normalized = candidate;
-  const bounded = normalized.length <= ERROR_DETAIL_LIMIT ? normalized : `${normalized.slice(0, ERROR_DETAIL_LIMIT - 1)}…`;
-  return repeatsPrivateInput(bounded, init) ? undefined : bounded;
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const data = JSON.parse(new TextDecoder().decode(bytes));
+    const detail = data?.error?.message ?? data?.detail?.message ?? data?.message ?? data?.detail ?? data?.error;
+    const rawCode = data?.detail?.error_type ?? data?.error?.code ?? data?.code;
+    // Only expose observed, known codes; arbitrary error fields may echo input.
+    const code = rawCode === 'max_tokens_exceeded' || rawCode === 'api_usage_error' ? rawCode : undefined;
+    // Validation arrays can include the original input; never serialize them.
+    if (typeof detail !== 'string') return { code };
+    let safe = detail;
+    const authorization = new Headers(init.headers).get('authorization') || '';
+    for (const secret of [authorization, authorization.replace(/^Bearer\s+/i, '')]) {
+      if (secret) safe = safe.split(secret).join('[redacted]');
+    }
+    safe = safe.replace(/\b(?:Bearer|Basic)\s+[^\s"'<>]+/gi, '[redacted]')
+      .replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]')
+      .replace(/((?:access_token|refresh_token|api_key|client_secret)["']?\s*[:=]\s*["']?)[^\s"'&,}]+/gi, '$1[redacted]')
+      .replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (repeatsPrivateInput(safe, init)) return { code };
+    return { code, detail: safe.slice(0, 400) || undefined };
+  } catch { return {}; }
+  finally {
+    clearTimeout(timer);
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+function httpError(status: number, { detail, code }: HttpDetails): Error {
+  const guidance = code === 'max_tokens_exceeded'
+    ? 'The page context exceeds Jev’s input limit. Narrow the visible page or task and try again.'
+    : status === 400 || status === 422
+    ? 'Jev rejected the request. Check the Jev model and endpoint in Connections; if they are correct, report this error with the task that triggered it.'
+    : status === 401 || status === 403
+      ? 'Check your TypeSafe API key and its access in Connections.'
+      : status === 404
+        ? 'Check the Jev endpoint and model in Connections.'
+        : status === 429
+          ? 'The Jev rate limit was reached. Wait briefly and try again.'
+          : status >= 500 ? 'Jev is temporarily unavailable. Try again shortly.'
+            : 'Check your Jev connection in Connections.';
+  return new Error(`Jev returned HTTP ${status}. ${guidance}${detail ? ` Server detail: ${detail}` : code ? ` Server code: ${code}.` : ''} No action executed.`);
+}
+
+function cancelBody(response?: Response) {
+  // Abort cancels an active JSON reader. An unconsumed late response still needs
+  // its body cancelled explicitly; never wait for a losing stream to drain.
+  if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
 }
 
 function pause(ms: number, signal?: AbortSignal): Promise<void> {
@@ -151,9 +189,12 @@ function attempt(endpoint: string, init: RequestInit, signal: AbortSignal | unde
           if (settled) { cancelBody(response); return; }
           if (RETRYABLE.has(response.status)) { overloaded(); clearTimeout(replacementTimer); }
           if (!response.ok) {
-            failures[index] = { kind: 'http', status: response.status };
-            const detail = RETRYABLE.has(response.status) ? (cancelBody(response), undefined) : await errorDetail(response, init);
-            failed(index, { kind: 'http', status: response.status, detail }); return;
+            // Keep the known status even if its optional body stalls or fails.
+            const failure: Extract<Outcome, { kind: 'http' }> = { kind: 'http', status: response.status };
+            failures[index] = failure;
+            if (RETRYABLE.has(response.status)) cancelBody(response);
+            else Object.assign(failure, await errorDetail(response, init, controller));
+            failed(index, failure); return;
           }
           phase = 'body';
           const value = await response.json() as JevResponse;
@@ -186,8 +227,7 @@ export async function fetchJevInference(endpoint: string, init: RequestInit, sig
     if (outcome.kind === 'success') return outcome.value;
     if (outcome.kind === 'http') {
       if (RETRYABLE.has(outcome.status) && index < 2) { await pause(300 * 2 ** index, signal); continue; }
-      if (outcome.detail) throw new Error(`Jev returned HTTP ${outcome.status}: ${outcome.detail} No action executed.`);
-      throw new Error(`Jev returned HTTP ${outcome.status}. Check your key, endpoint, and model. No action executed.`);
+      throw httpError(outcome.status, outcome);
     }
     if (outcome.phase === 'body') throw outcome.error;
     throw new Error(outcome.phase === 'deadline' ? 'Jev timed out. No action executed.' : 'Could not connect to Jev. No action executed.', { cause: outcome.error });
